@@ -1,0 +1,77 @@
+name: Build Atari 7800 ROM
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '**.bas'
+      - 'gfx/**'
+      - 'tools/**'
+      - '.github/workflows/build-rom.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out game
+        uses: actions/checkout@v4
+
+      - name: Verify project source exists
+        run: |
+          if [ ! -f carl_complete.bas ]; then
+            echo 'ERROR: carl_complete.bas is missing from the repository root.' | tee build.log
+            exit 1
+          fi
+
+      - name: Install Python graphics dependency
+        if: ${{ hashFiles('tools/generate_assets.py') != '' }}
+        run: python -m pip install --disable-pip-version-check Pillow
+
+      - name: Generate indexed graphics
+        if: ${{ hashFiles('tools/generate_assets.py') != '' }}
+        run: python tools/generate_assets.py
+
+      - name: Install Wasmtime
+        shell: bash
+        run: |
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Download 7800basic v0.40
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v0.40 https://github.com/7800-devtools/7800basic.git "$RUNNER_TEMP/7800basic"
+          chmod +x "$RUNNER_TEMP/7800basic"/*.sh
+
+      - name: Compile game
+        shell: bash
+        run: |
+          export bas7800dir="$RUNNER_TEMP/7800basic"
+          export PATH="$bas7800dir:$HOME/.wasmtime/bin:$PATH"
+          set -o pipefail
+          "$bas7800dir/7800basic.sh" carl_complete.bas 2>&1 | tee build.log
+
+      - name: Collect build outputs
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p build-output
+          cp build.log build-output/ 2>/dev/null || true
+          find . -maxdepth 2 -type f \( -name '*.a78' -o -name '*.bin' -o -name '*.asm' -o -name '*.list.txt' -o -name '*.symbol.txt' \) -exec cp {} build-output/ \;
+          echo 'Collected files:'
+          find build-output -maxdepth 1 -type f -printf '%f\n' | sort
+
+      - name: Upload compiler output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: atari-7800-build
+          path: build-output/
+          if-no-files-found: error
+          retention-days: 30
