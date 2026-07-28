@@ -1,0 +1,123 @@
+name: Build Atari 7800 ROM
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASIC7800_VERSION: v0.40
+  SOURCE_FILE: carl_demo.bas
+
+jobs:
+  build:
+    name: Compile with 7800basic
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Install runtime and utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y curl unzip
+          curl https://wasmtime.dev/install.sh -sSf | bash
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+
+      - name: Download 7800basic
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -L --fail --retry 3 \
+            "https://github.com/7800-devtools/7800basic/archive/refs/tags/${BASIC7800_VERSION}.zip" \
+            -o "$RUNNER_TEMP/7800basic.zip"
+          unzip -q "$RUNNER_TEMP/7800basic.zip" -d "$RUNNER_TEMP"
+          BAS_DIR="$(find "$RUNNER_TEMP" -maxdepth 1 -type d -name '7800basic-*' | head -n 1)"
+          test -n "$BAS_DIR"
+          chmod +x "$BAS_DIR"/*.sh
+          echo "BAS7800DIR=$BAS_DIR" >> "$GITHUB_ENV"
+          echo "$BAS_DIR" >> "$GITHUB_PATH"
+
+      - name: Extract project source and graphics
+        shell: bash
+        run: unzip -o package/dcc7800-project-source.zip -d .
+
+      - name: Validate project assets
+        shell: bash
+        run: python3 tools/preflight.py
+
+      - name: Compile project
+        id: compile
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p build dist
+          {
+            echo "7800basic version: ${BASIC7800_VERSION}"
+            echo "Source: ${SOURCE_FILE}"
+            echo "Compiler directory: ${BAS7800DIR}"
+            echo
+            export bas7800dir="${BAS7800DIR}"
+            "${BAS7800DIR}/7800basic.sh" "${SOURCE_FILE}"
+          } 2>&1 | tee build/compiler.log
+          status=${PIPESTATUS[0]}
+
+          find . -maxdepth 2 -type f \( -name '*.a78' -o -name '*.bin' \) \
+            -not -path './dist/*' -exec cp -v {} dist/ \; | tee -a build/compiler.log
+
+          echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+          exit "${status}"
+
+      - name: Write build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Atari 7800 build"
+            echo
+            echo "- Source: ${SOURCE_FILE}"
+            echo "- Compiler: 7800basic ${BASIC7800_VERSION}"
+            echo "- Compiler exit code: ${{ steps.compile.outputs.exit_code || 'not available' }}"
+            if compgen -G "dist/*.a78" > /dev/null || compgen -G "dist/*.bin" > /dev/null; then
+              echo "- Result: ROM generated"
+              find dist -maxdepth 1 -type f -printf '%f\n'
+            else
+              echo "- Result: no ROM generated, inspect the compiler-log artifact"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload compiler log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compiler-log
+          path: build/compiler.log
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Upload ROM
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dungeon-crawler-carl-atari7800-rom
+          path: |
+            dist/*.a78
+            dist/*.bin
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Fail job when compilation failed
+        if: steps.compile.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "Compilation failed. Download the compiler-log artifact for the complete diagnostic."
+          exit 1
